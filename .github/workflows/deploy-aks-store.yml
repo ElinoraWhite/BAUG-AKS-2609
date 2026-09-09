@@ -1,0 +1,72 @@
+name: Deploy AKS Store
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - aks-store-quickstart.yaml
+      - .github/workflows/deploy-aks-store.yml
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure login with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set AKS context
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ vars.RESOURCE_GROUP_NAME }}
+          cluster-name: ${{ vars.CLUSTER_NAME }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Dry run deployment
+        run: kubectl apply --dry-run=server --filename aks-store-quickstart.yaml --namespace "${{ vars.KUBERNETES_NAMESPACE }}"
+
+      - name: Determine deployment strategy
+        id: strategy
+        shell: bash
+        run: |
+          existing_workloads="$(kubectl get deployment,statefulset --namespace "${{ vars.KUBERNETES_NAMESPACE }}" --output name 2>/dev/null | grep -E '(^deployment.apps/store-front$|^deployment.apps/order-service$|^deployment.apps/product-service$|^statefulset.apps/rabbitmq$)' || true)"
+          if [ -n "$existing_workloads" ]; then
+            echo "strategy=blue-green" >> "$GITHUB_OUTPUT"
+          else
+            echo "strategy=basic" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy initial version
+        if: steps.strategy.outputs.strategy == 'basic'
+        uses: azure/k8s-deploy@v5
+        with:
+          action: deploy
+          namespace: ${{ vars.KUBERNETES_NAMESPACE }}
+          manifests: aks-store-quickstart.yaml
+          strategy: basic
+
+      - name: Deploy update with blue-green strategy
+        if: steps.strategy.outputs.strategy == 'blue-green'
+        uses: azure/k8s-deploy@v5
+        with:
+          action: deploy
+          namespace: ${{ vars.KUBERNETES_NAMESPACE }}
+          manifests: aks-store-quickstart.yaml
+          strategy: blue-green
+          route-method: service
