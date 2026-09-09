@@ -1,0 +1,120 @@
+name: Deploy AKS Store
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - aks-store-quickstart.yaml
+      - scripts/render-bluegreen.sh
+      - .github/workflows/deploy-aks-store.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-aks-store-dev
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to AKS (dev)
+    runs-on: ubuntu-latest
+    environment: dev
+    env:
+      MANIFEST: aks-store-quickstart.yaml
+      NAMESPACE: ${{ vars.KUBERNETES_NAMESPACE }}
+      RENDER_DIR: ${{ runner.temp }}/rendered
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Log in to Azure with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set up kubelogin
+        uses: azure/use-kubelogin@v1
+
+      - name: Set the AKS cluster context
+        uses: azure/aks-set-context@v5
+        with:
+          resource-group: ${{ vars.RESOURCE_GROUP_NAME }}
+          cluster-name: ${{ vars.CLUSTER_NAME }}
+          admin: 'false'
+          use-kubelogin: 'true'
+
+      - name: Ensure the namespace exists
+        run: |
+          kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Determine the target color
+        id: color
+        run: |
+          set -euo pipefail
+          app="$(yq eval-all -N 'select(.kind == "Deployment") | .spec.selector.matchLabels.app' "${MANIFEST}" | head -1)"
+          service="$(APP="${app}" yq eval-all -N 'select(.kind == "Service" and .spec.selector.app == strenv(APP)) | .metadata.name' "${MANIFEST}" | head -1)"
+          active="$(kubectl -n "${NAMESPACE}" get service "${service}" -o jsonpath='{.spec.selector.color}' --ignore-not-found)"
+          if [ "${active}" = "blue" ]; then
+            target=green
+          else
+            target=blue
+          fi
+          echo "Active color: ${active:-<none>}, target color: ${target}"
+          {
+            echo "active=${active}"
+            echo "target=${target}"
+          } >>"${GITHUB_OUTPUT}"
+
+      - name: Render the manifests for the target color
+        env:
+          TARGET_COLOR: ${{ steps.color.outputs.target }}
+        run: |
+          ./scripts/render-bluegreen.sh "${MANIFEST}" "${TARGET_COLOR}" "${RENDER_DIR}"
+
+      - name: Dry run the deployment
+        run: |
+          set -euo pipefail
+          for manifest in infra workloads services; do
+            echo "::group::Dry run ${manifest}.yaml"
+            kubectl -n "${NAMESPACE}" apply --dry-run=server -f "${RENDER_DIR}/${manifest}.yaml"
+            echo "::endgroup::"
+          done
+
+      - name: Deploy the shared resources
+        run: |
+          set -euo pipefail
+          kubectl -n "${NAMESPACE}" apply -f "${RENDER_DIR}/infra.yaml"
+          kubectl -n "${NAMESPACE}" rollout status statefulset/rabbitmq --timeout=5m
+
+      - name: Deploy the ${{ steps.color.outputs.target }} workloads
+        run: |
+          set -euo pipefail
+          kubectl -n "${NAMESPACE}" apply -f "${RENDER_DIR}/workloads.yaml"
+          for deployment in $(yq eval -N '.metadata.name' "${RENDER_DIR}/workloads.yaml"); do
+            kubectl -n "${NAMESPACE}" rollout status "deployment/${deployment}" --timeout=10m
+          done
+
+      - name: Switch traffic to the ${{ steps.color.outputs.target }} workloads
+        id: cutover
+        run: |
+          kubectl -n "${NAMESPACE}" apply -f "${RENDER_DIR}/services.yaml"
+
+      - name: Scale down the ${{ steps.color.outputs.active }} workloads
+        if: steps.color.outputs.active != ''
+        env:
+          ACTIVE_COLOR: ${{ steps.color.outputs.active }}
+        run: |
+          kubectl -n "${NAMESPACE}" scale deployment -l "color=${ACTIVE_COLOR}" --replicas=0
+
+      - name: Roll back the ${{ steps.color.outputs.target }} workloads
+        if: failure() && steps.color.outputs.active != '' && steps.cutover.outcome != 'success'
+        env:
+          TARGET_COLOR: ${{ steps.color.outputs.target }}
+        run: |
+          kubectl -n "${NAMESPACE}" scale deployment -l "color=${TARGET_COLOR}" --replicas=0 || true
