@@ -1,0 +1,94 @@
+name: Deploy AKS Store
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - aks-store-quickstart.yaml
+      - scripts/render-bluegreen.sh
+      - .github/workflows/deploy-aks-store.yml
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: dev
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set AKS context
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ vars.RESOURCE_GROUP_NAME }}
+          cluster-name: ${{ vars.CLUSTER_NAME }}
+
+      - name: Choose blue/green target color
+        id: color
+        env:
+          KUBERNETES_NAMESPACE: ${{ vars.KUBERNETES_NAMESPACE }}
+        run: |
+          set -euo pipefail
+          ACTIVE_COLOR="$(kubectl get service store-front -n "$KUBERNETES_NAMESPACE" -o jsonpath='{.spec.selector.color}' 2>/dev/null || true)"
+
+          if [[ "$ACTIVE_COLOR" == "blue" ]]; then
+            TARGET_COLOR="green"
+            PREVIOUS_COLOR="blue"
+          else
+            TARGET_COLOR="blue"
+            PREVIOUS_COLOR="green"
+          fi
+
+          echo "target_color=$TARGET_COLOR" >> "$GITHUB_OUTPUT"
+          echo "previous_color=$PREVIOUS_COLOR" >> "$GITHUB_OUTPUT"
+
+      - name: Render manifests for target color
+        run: |
+          set -euo pipefail
+          chmod +x ./scripts/render-bluegreen.sh
+          ./scripts/render-bluegreen.sh ./aks-store-quickstart.yaml ./aks-store-bluegreen.yaml "${{ steps.color.outputs.target_color }}"
+
+      - name: Dry run deployment
+        env:
+          KUBERNETES_NAMESPACE: ${{ vars.KUBERNETES_NAMESPACE }}
+        run: |
+          set -euo pipefail
+          kubectl apply --dry-run=server -f ./aks-store-bluegreen.yaml -n "$KUBERNETES_NAMESPACE"
+
+      - name: Deploy
+        env:
+          KUBERNETES_NAMESPACE: ${{ vars.KUBERNETES_NAMESPACE }}
+        run: |
+          set -euo pipefail
+          kubectl apply -f ./aks-store-bluegreen.yaml -n "$KUBERNETES_NAMESPACE"
+
+      - name: Wait for rollout
+        env:
+          KUBERNETES_NAMESPACE: ${{ vars.KUBERNETES_NAMESPACE }}
+        run: |
+          set -euo pipefail
+          kubectl rollout status deployment/order-service-${{ steps.color.outputs.target_color }} -n "$KUBERNETES_NAMESPACE" --timeout=5m
+          kubectl rollout status deployment/product-service-${{ steps.color.outputs.target_color }} -n "$KUBERNETES_NAMESPACE" --timeout=5m
+          kubectl rollout status deployment/store-front-${{ steps.color.outputs.target_color }} -n "$KUBERNETES_NAMESPACE" --timeout=5m
+
+      - name: Remove previous color deployments
+        env:
+          KUBERNETES_NAMESPACE: ${{ vars.KUBERNETES_NAMESPACE }}
+        run: |
+          set -euo pipefail
+          kubectl delete deployment/order-service-${{ steps.color.outputs.previous_color }} -n "$KUBERNETES_NAMESPACE" --ignore-not-found
+          kubectl delete deployment/product-service-${{ steps.color.outputs.previous_color }} -n "$KUBERNETES_NAMESPACE" --ignore-not-found
+          kubectl delete deployment/store-front-${{ steps.color.outputs.previous_color }} -n "$KUBERNETES_NAMESPACE" --ignore-not-found
